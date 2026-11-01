@@ -50,6 +50,7 @@ pub use span_processor::{
     OTEL_BSP_SCHEDULE_DELAY_DEFAULT,
 };
 
+pub use tracer::LocalTracer;
 pub use tracer::SdkTracer;
 pub use tracer::SdkTracer as Tracer; // for back-compat else tracing-opentelemetry won't build
 

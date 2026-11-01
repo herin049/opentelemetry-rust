@@ -95,6 +95,16 @@ name = "trace"
 harness = false
 
 [[bench]]
+name = "trace_scaling"
+harness = false
+required-features = ["trace"]
+
+[[bench]]
+name = "trace_scaling_local"
+harness = false
+required-features = ["trace"]
+
+[[bench]]
 name = "span"
 harness = false
 

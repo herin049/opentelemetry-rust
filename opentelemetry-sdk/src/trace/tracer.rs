@@ -17,22 +17,134 @@ use opentelemetry::{
     Context, InstrumentationScope, KeyValue, TraceId,
 };
 use std::fmt;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 /// `Tracer` implementation to create and manage spans
+///
+/// `SdkTracer` is `Send + Sync` and all its spans share one reference count. If
+/// many threads create spans at a high rate, use [`SdkTracer::local`] to avoid
+/// contention on that count.
 #[derive(Clone)]
 pub struct SdkTracer {
-    scope: Arc<InstrumentationScope>,
+    owner: Arc<SpanOwner>,
+}
+
+/// Per-thread handle for creating spans without contending with other threads.
+///
+/// Spans keep their tracer's state alive through a reference count, so creating
+/// and ending a span writes to that count. Spans from an [`SdkTracer`] all share
+/// one count, which is contended when several threads create spans at once. A
+/// `LocalTracer` has its own count, which only its thread normally writes to.
+/// Spans it creates behave exactly like those from the [`SdkTracer`] it came from.
+///
+/// Create one per thread with [`SdkTracer::local`]:
+///
+/// ```
+/// use opentelemetry::trace::{Tracer, TracerProvider};
+/// use opentelemetry_sdk::trace::SdkTracerProvider;
+///
+/// let provider = SdkTracerProvider::builder().build();
+/// let tracer = provider.tracer("my-component");
+///
+/// std::thread::scope(|scope| {
+///     for _ in 0..2 {
+///         scope.spawn(|| {
+///             let local = tracer.local();
+///             let _span = local.start("work");
+///         });
+///     }
+/// });
+/// ```
+///
+/// # Threads and async
+///
+/// `LocalTracer` is neither `Send` nor `Sync`, so it stays on the thread that
+/// created it and cannot be held across an `.await` in a `Send` future:
+///
+/// ```compile_fail,E0277
+/// fn assert_send<T: Send>() {}
+/// assert_send::<opentelemetry_sdk::trace::LocalTracer>();
+/// ```
+///
+/// ```compile_fail,E0277
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<opentelemetry_sdk::trace::LocalTracer>();
+/// ```
+///
+/// The spans it creates are `Send + Sync` and may move to other threads, but
+/// ending one on another thread writes to this tracer's count from there, which
+/// gives back some of the benefit if done often.
+///
+/// # Provider lifetime
+///
+/// A `LocalTracer` keeps its provider alive, like an [`SdkTracer`] does. One kept
+/// in a long-lived `thread_local!` can delay the shutdown that happens when the
+/// last provider reference is dropped, so call
+/// [`SdkTracerProvider::shutdown`] explicitly in that case.
+pub struct LocalTracer {
+    owner: Arc<SpanOwner>,
+    _not_send: PhantomData<*const ()>,
+}
+
+/// State shared by every handle derived from one tracer.
+struct TracerInner {
+    scope: InstrumentationScope,
     provider: SdkTracerProvider,
+}
+
+/// Reference-counted owner retained by spans.
+///
+/// The count in the surrounding `Arc` must sit on its own cache line. Owners are
+/// small separate allocations, and some allocators (for example macOS malloc)
+/// can place owners created by different threads next to each other, so their
+/// counts would false-share and reintroduce the contention `LocalTracer` removes.
+/// The alignment follows crossbeam's `CachePadded`: 128 bytes where adjacent-line
+/// prefetching or 128-byte lines are common, 64 bytes elsewhere.
+#[cfg_attr(
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "powerpc64"
+    ),
+    repr(align(128))
+)]
+#[cfg_attr(
+    not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "powerpc64"
+    )),
+    repr(align(64))
+)]
+pub(crate) struct SpanOwner {
+    inner: Arc<TracerInner>,
+}
+
+impl fmt::Debug for SpanOwner {
+    /// Formats the owner using the given formatter.
+    /// Omitting `provider` here is necessary to avoid cycles.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Tracer")
+            .field("name", &self.inner.scope.name())
+            .field("version", &self.inner.scope.version())
+            .finish()
+    }
 }
 
 impl fmt::Debug for SdkTracer {
     /// Formats the `Tracer` using the given formatter.
-    /// Omitting `provider` here is necessary to avoid cycles.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Tracer")
-            .field("name", &self.scope.name())
-            .field("version", &self.scope.version())
+        self.owner.fmt(f)
+    }
+}
+
+impl fmt::Debug for LocalTracer {
+    /// Formats the `LocalTracer` using the given formatter.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalTracer")
+            .field("name", &self.owner.inner.scope.name())
+            .field("version", &self.owner.inner.scope.version())
             .finish()
     }
 }
@@ -41,23 +153,57 @@ impl SdkTracer {
     /// Create a new tracer (used internally by `TracerProvider`s).
     pub(crate) fn new(scope: InstrumentationScope, provider: SdkTracerProvider) -> Self {
         SdkTracer {
-            scope: Arc::new(scope),
-            provider,
+            owner: Arc::new(SpanOwner {
+                inner: Arc::new(TracerInner { scope, provider }),
+            }),
+        }
+    }
+
+    /// Creates a [`LocalTracer`] for the current thread.
+    ///
+    /// This allocates, so create one per thread and reuse it rather than calling
+    /// this for each span.
+    pub fn local(&self) -> LocalTracer {
+        LocalTracer {
+            owner: Arc::new(SpanOwner {
+                inner: Arc::clone(&self.owner.inner),
+            }),
+            _not_send: PhantomData,
         }
     }
 
     /// TracerProvider associated with this tracer.
+    #[cfg(test)]
     pub(crate) fn provider(&self) -> &SdkTracerProvider {
-        &self.provider
+        self.owner.provider()
     }
 
     /// Instrumentation scope of this tracer.
+    #[cfg(test)]
     pub(crate) fn instrumentation_scope(&self) -> &InstrumentationScope {
-        &self.scope
+        self.owner.instrumentation_scope()
+    }
+
+    /// Owner retained by spans created from this tracer.
+    #[cfg(test)]
+    pub(crate) fn span_owner(&self) -> Arc<SpanOwner> {
+        Arc::clone(&self.owner)
+    }
+}
+
+impl SpanOwner {
+    /// TracerProvider associated with this owner.
+    pub(crate) fn provider(&self) -> &SdkTracerProvider {
+        &self.inner.provider
+    }
+
+    /// Instrumentation scope of this owner.
+    pub(crate) fn instrumentation_scope(&self) -> &InstrumentationScope {
+        &self.inner.scope
     }
 
     fn build_recording_span(
-        &self,
+        self: &Arc<Self>,
         psc: &SpanContext,
         sc: SpanContext,
         mut builder: SpanBuilder,
@@ -147,29 +293,18 @@ impl SdkTracer {
                 links: span_links,
                 status: Status::default(),
             }),
-            self.clone(),
+            Arc::clone(self),
             span_limits,
         )
     }
-}
 
-impl opentelemetry::trace::Tracer for SdkTracer {
-    /// This implementation of `Tracer` produces `sdk::Span` instances.
-    type Span = Span;
-
-    /// Starts a span from a `SpanBuilder`.
-    ///
-    /// Each span has zero or one parent spans and zero or more child spans, which
-    /// represent causally related operations. A tree of related spans comprises a
-    /// trace. A span is said to be a _root span_ if it does not have a parent. Each
-    /// trace includes a single root span, which is the shared ancestor of all other
-    /// spans in the trace.
-    fn build_with_context(&self, builder: SpanBuilder, parent_cx: &Context) -> Self::Span {
+    /// Starts a span owned by this `SpanOwner`.
+    fn build_span(self: &Arc<Self>, builder: SpanBuilder, parent_cx: &Context) -> Span {
         if parent_cx.is_telemetry_suppressed() {
             return Span::new(
                 SpanContext::empty_context(),
                 None,
-                self.clone(),
+                Arc::clone(self),
                 SpanLimits::default(),
             );
         }
@@ -180,7 +315,7 @@ impl opentelemetry::trace::Tracer for SdkTracer {
             return Span::new(
                 SpanContext::empty_context(),
                 None,
-                self.clone(),
+                Arc::clone(self),
                 SpanLimits::default(),
             );
         }
@@ -260,7 +395,7 @@ impl opentelemetry::trace::Tracer for SdkTracer {
                     false,
                     trace_state,
                 );
-                Span::new(span_context, None, self.clone(), span_limits)
+                Span::new(span_context, None, Arc::clone(self), span_limits)
             }
         };
 
@@ -275,12 +410,43 @@ impl opentelemetry::trace::Tracer for SdkTracer {
     }
 }
 
+impl opentelemetry::trace::Tracer for SdkTracer {
+    /// This implementation of `Tracer` produces `sdk::Span` instances.
+    type Span = Span;
+
+    /// Starts a span from a `SpanBuilder`.
+    ///
+    /// Each span has zero or one parent spans and zero or more child spans, which
+    /// represent causally related operations. A tree of related spans comprises a
+    /// trace. A span is said to be a _root span_ if it does not have a parent. Each
+    /// trace includes a single root span, which is the shared ancestor of all other
+    /// spans in the trace.
+    fn build_with_context(&self, builder: SpanBuilder, parent_cx: &Context) -> Self::Span {
+        self.owner.build_span(builder, parent_cx)
+    }
+}
+
+impl opentelemetry::trace::Tracer for LocalTracer {
+    /// This implementation of `Tracer` produces `sdk::Span` instances.
+    type Span = Span;
+
+    /// Starts a span from a `SpanBuilder`.
+    ///
+    /// See [`SdkTracer`]'s implementation; only the owner the span retains differs.
+    fn build_with_context(&self, builder: SpanBuilder, parent_cx: &Context) -> Self::Span {
+        self.owner.build_span(builder, parent_cx)
+    }
+}
+
 #[cfg(all(test, feature = "testing", feature = "trace"))]
 mod tests {
     use crate::{
         propagation::TraceContextPropagator,
         testing::trace::TestSpan,
-        trace::{IdGenerator, Sampler, SamplingDecision, SamplingResult, ShouldSample},
+        trace::{
+            IdGenerator, InMemorySpanExporter, Sampler, SamplingDecision, SamplingResult,
+            SdkTracerProvider, ShouldSample,
+        },
     };
     use opentelemetry::{
         propagation::{Extractor, TextMapPropagator},
@@ -288,9 +454,91 @@ mod tests {
             Link, Span, SpanContext, SpanId, SpanKind, TraceContextExt, TraceFlags, TraceId,
             TraceState, Tracer, TracerProvider,
         },
-        Context, KeyValue,
+        Context, InstrumentationScope, KeyValue,
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn tracer_is_one_shared_pointer() {
+        assert_eq!(
+            std::mem::size_of::<super::SdkTracer>(),
+            std::mem::size_of::<std::sync::Arc<()>>()
+        );
+    }
+
+    #[test]
+    fn span_owner_is_cache_line_aligned() {
+        assert!(std::mem::align_of::<super::SpanOwner>() >= 64);
+    }
+
+    #[test]
+    fn span_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<crate::trace::Span>();
+    }
+
+    fn local_test_provider(sampler: Sampler) -> (SdkTracerProvider, InMemorySpanExporter) {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_sampler(sampler)
+            .with_simple_exporter(exporter.clone())
+            .build();
+        (provider, exporter)
+    }
+
+    #[test]
+    fn local_tracer_exports_spans_with_tracer_scope() {
+        let (provider, exporter) = local_test_provider(Sampler::AlwaysOn);
+        let scope = InstrumentationScope::builder("local-scope")
+            .with_version("1.2.3")
+            .build();
+        let local = provider.tracer_with_scope(scope.clone()).local();
+
+        local.start("work").end();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "work");
+        assert_eq!(spans[0].instrumentation_scope, scope);
+    }
+
+    #[test]
+    fn local_tracer_respects_sampler() {
+        let (provider, exporter) = local_test_provider(Sampler::AlwaysOff);
+        let local = provider.tracer("test").local();
+
+        let mut span = local.start("dropped");
+        assert!(!span.is_recording());
+        span.end();
+
+        assert!(exporter.get_finished_spans().unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_tracer_span_can_end_on_another_thread() {
+        let (provider, exporter) = local_test_provider(Sampler::AlwaysOn);
+        let local = provider.tracer("test").local();
+
+        let mut span = local.start("moved");
+        std::thread::spawn(move || span.end()).join().unwrap();
+
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "moved");
+    }
+
+    #[test]
+    fn local_tracer_is_noop_after_provider_shutdown() {
+        let (provider, exporter) = local_test_provider(Sampler::AlwaysOn);
+        let local = provider.tracer("test").local();
+
+        provider.shutdown().unwrap();
+
+        let span = local.start("after-shutdown");
+        assert!(!span.is_recording());
+        drop(span);
+        assert!(exporter.get_finished_spans().unwrap().is_empty());
+    }
 
     #[derive(Clone, Debug)]
     struct TestSampler {}
